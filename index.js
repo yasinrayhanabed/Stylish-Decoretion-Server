@@ -1,4 +1,3 @@
-// index.js
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
@@ -26,7 +25,7 @@ async function run() {
     await client.connect();
     console.log("Connected to MongoDB");
 
-    const db = client.db("styledb");
+    const db = client.db(process.env.DB_NAME);
     usersCollection = db.collection("users");
     servicesCollection = db.collection("services");
     bookingsCollection = db.collection("bookings");
@@ -35,9 +34,8 @@ async function run() {
     app.post("/api/auth/register", async (req, res) => {
       try {
         const { name, email, password } = req.body;
-        if (!name || !email || !password) {
+        if (!name || !email || !password)
           return res.status(400).json({ message: "Name, email and password are required" });
-        }
 
         const exists = await usersCollection.findOne({ email });
         if (exists) return res.status(400).json({ message: "User already exists" });
@@ -134,157 +132,52 @@ async function run() {
       }
     });
 
-    // ===== MIDDLEWARE =====
-    const verifyToken = (req, res, next) => {
-      const authHeader = req.headers.authorization;
-      if (!authHeader) return res.status(401).json({ message: "Unauthorized" });
+    // ===== DASHBOARD / DATA =====
 
-      const token = authHeader.split(" ")[1];
-      if (!token) return res.status(401).json({ message: "Unauthorized" });
-
+    // All services
+    app.get("/services", async (req, res) => {
       try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = decoded;
-        next();
-      } catch (err) {
-        return res.status(403).json({ message: "Invalid token" });
-      }
-    };
-
-    // ===== SERVICES =====
-    app.get("/api/services", async (req, res) => {
-      try {
-        const services = await servicesCollection.find({}).toArray();
+        const services = await servicesCollection.find().toArray();
         res.json(services);
-      } catch (err) {
-        console.error("Get services error:", err);
+      } catch {
         res.status(500).json({ message: "Failed to fetch services" });
       }
     });
 
-    app.get("/api/services/:id", async (req, res) => {
+    // All decorators
+    app.get("/decorators", async (req, res) => {
       try {
-        const service = await servicesCollection.findOne({ _id: new ObjectId(req.params.id) });
-        res.json(service);
-      } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: "Failed to fetch service" });
-      }
-    });
-
-    app.post("/api/services", verifyToken, async (req, res) => {
-      try {
-        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
-        const result = await servicesCollection.insertOne(req.body);
-        res.status(201).json({ success: true, serviceId: result.insertedId });
-      } catch (err) {
-        console.error("Create service error:", err);
-        res.status(500).json({ message: "Failed to create service" });
-      }
-    });
-
-    app.put("/api/services/:id", verifyToken, async (req, res) => {
-      try {
-        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
-        const result = await servicesCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: req.body });
-        res.json({ success: result.modifiedCount > 0 });
-      } catch (err) {
-        console.error("Update service error:", err);
-        res.status(500).json({ message: "Failed to update service" });
-      }
-    });
-
-    app.delete("/api/services/:id", verifyToken, async (req, res) => {
-      try {
-        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
-        const result = await servicesCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-        res.json({ success: result.deletedCount > 0 });
-      } catch (err) {
-        console.error("Delete service error:", err);
-        res.status(500).json({ message: "Failed to delete service" });
-      }
-    });
-
-    // ===== BOOKINGS =====
-    app.post("/api/bookings", verifyToken, async (req, res) => {
-      try {
-        const booking = { ...req.body, userId: req.user.id, userEmail: req.user.email, status: "Assigned", paymentStatus: "Pending", createdAt: new Date() };
-        const result = await bookingsCollection.insertOne(booking);
-        res.status(201).json({ success: true, bookingId: result.insertedId });
-      } catch (err) {
-        console.error("Create booking error:", err);
-        res.status(500).json({ message: "Failed to create booking" });
-      }
-    });
-
-    app.get("/api/bookings/user", verifyToken, async (req, res) => {
-      try {
-        const bookings = await bookingsCollection.find({ userEmail: req.user.email }).toArray();
-        res.json(bookings);
-      } catch (err) {
-        console.error("Get user bookings error:", err);
-        res.status(500).json({ message: "Failed to fetch bookings" });
-      }
-    });
-
-    app.get("/api/bookings", verifyToken, async (req, res) => {
-      try {
-        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
-        const bookings = await bookingsCollection.find({}).toArray();
-        res.json(bookings);
-      } catch (err) {
-        console.error("Get bookings error:", err);
-        res.status(500).json({ message: "Failed to fetch bookings" });
-      }
-    });
-
-    app.put("/api/bookings/:id", verifyToken, async (req, res) => {
-      try {
-        if (!["admin", "decorator"].includes(req.user.role)) return res.status(403).json({ message: "Forbidden" });
-        const result = await bookingsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: req.body });
-        res.json({ success: result.modifiedCount > 0 });
-      } catch (err) {
-        console.error("Update booking error:", err);
-        res.status(500).json({ message: "Failed to update booking" });
-      }
-    });
-
-    app.delete("/api/bookings/:id", verifyToken, async (req, res) => {
-      try {
-        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
-        const result = await bookingsCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-        res.json({ success: result.deletedCount > 0 });
-      } catch (err) {
-        console.error("Delete booking error:", err);
-        res.status(500).json({ message: "Failed to delete booking" });
-      }
-    });
-
-    // ===== DECORATORS =====
-    app.get("/api/decorators", verifyToken, async (req, res) => {
-      try {
-        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
         const decorators = await usersCollection.find({ role: "decorator" }).toArray();
         res.json(decorators);
-      } catch (err) {
-        console.error("Get decorators error:", err);
+      } catch {
         res.status(500).json({ message: "Failed to fetch decorators" });
       }
     });
 
-    app.put("/api/decorators/:id", verifyToken, async (req, res) => {
+    // Bookings
+    app.get("/bookings", async (req, res) => {
       try {
-        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
-        const result = await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { role: "decorator" } });
-        res.json({ success: result.modifiedCount > 0 });
-      } catch (err) {
-        console.error("Make decorator error:", err);
-        res.status(500).json({ message: "Failed to update user role" });
+        const bookings = await bookingsCollection.find().toArray();
+        res.json(bookings);
+      } catch {
+        res.status(500).json({ message: "Failed to fetch bookings" });
+      }
+    });
+
+    // Bookings for a specific user
+    app.get("/bookings/my/:userId", async (req, res) => {
+      try {
+        const { userId } = req.params;
+        const bookings = await bookingsCollection.find({ userId }).toArray();
+        res.json(bookings);
+      } catch {
+        res.status(500).json({ message: "Failed to fetch user bookings" });
       }
     });
 
     // ===== DEFAULT =====
     app.get("/", (req, res) => res.send("StyleDecor Backend Running"));
+
   } finally {
     // client stays connected
   }
