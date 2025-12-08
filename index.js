@@ -2,7 +2,7 @@
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
-const bcrypt = require("bcrypt");
+const bcrypt = require("bcryptjs");
 require("dotenv").config();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
@@ -14,10 +14,12 @@ app.use(cors());
 app.use(express.json());
 
 // MongoDB Connection
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.xdad6f7.mongodb.net/?appName=Cluster0`;
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.xdad6f7.mongodb.net/?retryWrites=true&w=majority`;
 const client = new MongoClient(uri, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
 });
+
+let usersCollection, servicesCollection, bookingsCollection;
 
 async function run() {
   try {
@@ -25,203 +27,266 @@ async function run() {
     console.log("Connected to MongoDB");
 
     const db = client.db("styledb");
-    const usersCollection = db.collection("users");
-    const servicesCollection = db.collection("services");
-    const bookingsCollection = db.collection("bookings");
+    usersCollection = db.collection("users");
+    servicesCollection = db.collection("services");
+    bookingsCollection = db.collection("bookings");
 
     // ===== AUTH =====
-
-    // Register
-    app.post("/api/register", async (req, res) => {
+    app.post("/api/auth/register", async (req, res) => {
       try {
-        const { name, email, password, role } = req.body;
-        const hashedPassword = await bcrypt.hash(password, 10);
+        const { name, email, password } = req.body;
+        if (!name || !email || !password) {
+          return res.status(400).json({ message: "Name, email and password are required" });
+        }
 
         const exists = await usersCollection.findOne({ email });
-        if (exists) return res.status(400).send({ message: "User already exists" });
+        if (exists) return res.status(400).json({ message: "User already exists" });
 
-        const result = await usersCollection.insertOne({
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const newUser = {
           name,
           email,
           password: hashedPassword,
-          role: role || "user",
-        });
+          role: "user",
+          createdAt: new Date(),
+        };
 
-        res.status(201).send({ success: true, userId: result.insertedId });
+        const result = await usersCollection.insertOne(newUser);
+        const insertedUser = await usersCollection.findOne(
+          { _id: result.insertedId },
+          { projection: { password: 0 } }
+        );
+
+        const token = jwt.sign(
+          { id: insertedUser._id.toString(), email: insertedUser.email, role: insertedUser.role, name: insertedUser.name },
+          process.env.JWT_SECRET,
+          { expiresIn: "7d" }
+        );
+
+        res.status(201).json({ token, user: insertedUser });
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Register error:", err);
+        res.status(500).json({ message: "Registration failed" });
       }
     });
 
-    // Login
-    app.post("/api/login", async (req, res) => {
+    app.post("/api/auth/login", async (req, res) => {
       try {
         const { email, password } = req.body;
+        if (!email || !password) return res.status(400).json({ message: "Email and password required" });
+
         const user = await usersCollection.findOne({ email });
-        if (!user) return res.status(404).send({ message: "User not found" });
+        if (!user) return res.status(404).json({ message: "User not found" });
 
-        const match = await bcrypt.compare(password, user.password);
-        if (!match) return res.status(400).send({ message: "Invalid credentials" });
+        const match = await bcrypt.compare(password, user.password || "");
+        if (!match) return res.status(400).json({ message: "Invalid credentials" });
 
-        const token = jwt.sign({ id: user._id, role: user.role, email: user.email }, process.env.JWT_SECRET, { expiresIn: "7d" });
+        const safeUser = { ...user };
+        delete safeUser.password;
 
-        res.send({ token, user: { name: user.name, email: user.email, role: user.role } });
+        const token = jwt.sign(
+          { id: user._id.toString(), email: user.email, role: user.role, name: user.name },
+          process.env.JWT_SECRET,
+          { expiresIn: "7d" }
+        );
+
+        res.json({ token, user: safeUser });
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Login error:", err);
+        res.status(500).json({ message: "Login failed" });
       }
     });
 
-    // Middleware: Verify JWT
+    app.post("/api/auth/google-login", async (req, res) => {
+      try {
+        const { name, email, photo, uid } = req.body;
+        if (!email) return res.status(400).json({ message: "Invalid Google user data" });
+
+        let user = await usersCollection.findOne({ email });
+
+        if (!user) {
+          const doc = {
+            name: name || "Google User",
+            email,
+            password: "",
+            role: "user",
+            googleId: uid || null,
+            photo: photo || null,
+            createdAt: new Date(),
+          };
+          const insertRes = await usersCollection.insertOne(doc);
+          user = await usersCollection.findOne({ _id: insertRes.insertedId }, { projection: { password: 0 } });
+        } else {
+          user = { ...user };
+          delete user.password;
+        }
+
+        const token = jwt.sign(
+          { id: user._id.toString(), email: user.email, role: user.role, name: user.name },
+          process.env.JWT_SECRET,
+          { expiresIn: "7d" }
+        );
+
+        res.json({ token, user });
+      } catch (err) {
+        console.error("Google login error:", err);
+        res.status(500).json({ message: "Google login failed" });
+      }
+    });
+
+    // ===== MIDDLEWARE =====
     const verifyToken = (req, res, next) => {
       const authHeader = req.headers.authorization;
-      if (!authHeader) return res.status(401).send({ message: "Unauthorized" });
+      if (!authHeader) return res.status(401).json({ message: "Unauthorized" });
 
       const token = authHeader.split(" ")[1];
-      jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-        if (err) return res.status(403).send({ message: "Forbidden" });
+      if (!token) return res.status(401).json({ message: "Unauthorized" });
+
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
         req.user = decoded;
         next();
-      });
+      } catch (err) {
+        return res.status(403).json({ message: "Invalid token" });
+      }
     };
 
     // ===== SERVICES =====
-
-    // Get all services
     app.get("/api/services", async (req, res) => {
       try {
         const services = await servicesCollection.find({}).toArray();
-        res.send(services);
+        res.json(services);
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ message: "Failed to fetch services" });
+        console.error("Get services error:", err);
+        res.status(500).json({ message: "Failed to fetch services" });
       }
     });
 
-    // Create new service (Admin)
+    app.get("/api/services/:id", async (req, res) => {
+      try {
+        const service = await servicesCollection.findOne({ _id: new ObjectId(req.params.id) });
+        res.json(service);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Failed to fetch service" });
+      }
+    });
+
     app.post("/api/services", verifyToken, async (req, res) => {
       try {
-        if (req.user.role !== "admin") return res.status(403).send({ message: "Forbidden" });
-        const service = req.body;
-        const result = await servicesCollection.insertOne(service);
-        res.status(201).send({ success: true, serviceId: result.insertedId });
+        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+        const result = await servicesCollection.insertOne(req.body);
+        res.status(201).json({ success: true, serviceId: result.insertedId });
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Create service error:", err);
+        res.status(500).json({ message: "Failed to create service" });
       }
     });
 
-    // Update service
     app.put("/api/services/:id", verifyToken, async (req, res) => {
       try {
-        if (req.user.role !== "admin") return res.status(403).send({ message: "Forbidden" });
-        const id = req.params.id;
-        const data = req.body;
-        const result = await servicesCollection.updateOne({ _id: new ObjectId(id) }, { $set: data });
-        res.send({ success: result.modifiedCount > 0 });
+        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+        const result = await servicesCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: req.body });
+        res.json({ success: result.modifiedCount > 0 });
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Update service error:", err);
+        res.status(500).json({ message: "Failed to update service" });
       }
     });
 
-    // Delete service
     app.delete("/api/services/:id", verifyToken, async (req, res) => {
       try {
-        if (req.user.role !== "admin") return res.status(403).send({ message: "Forbidden" });
-        const id = req.params.id;
-        const result = await servicesCollection.deleteOne({ _id: new ObjectId(id) });
-        res.send({ success: result.deletedCount > 0 });
+        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+        const result = await servicesCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: result.deletedCount > 0 });
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Delete service error:", err);
+        res.status(500).json({ message: "Failed to delete service" });
       }
     });
 
     // ===== BOOKINGS =====
-
-    // Create booking
     app.post("/api/bookings", verifyToken, async (req, res) => {
       try {
-        const booking = { ...req.body, userEmail: req.user.email, status: "Assigned" };
+        const booking = { ...req.body, userId: req.user.id, userEmail: req.user.email, status: "Assigned", paymentStatus: "Pending", createdAt: new Date() };
         const result = await bookingsCollection.insertOne(booking);
-        res.status(201).send({ success: true, bookingId: result.insertedId });
+        res.status(201).json({ success: true, bookingId: result.insertedId });
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Create booking error:", err);
+        res.status(500).json({ message: "Failed to create booking" });
       }
     });
 
-    // Get user's bookings
     app.get("/api/bookings/user", verifyToken, async (req, res) => {
       try {
         const bookings = await bookingsCollection.find({ userEmail: req.user.email }).toArray();
-        res.send(bookings);
+        res.json(bookings);
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Get user bookings error:", err);
+        res.status(500).json({ message: "Failed to fetch bookings" });
       }
     });
 
-    // Update booking status (Admin / Decorator)
+    app.get("/api/bookings", verifyToken, async (req, res) => {
+      try {
+        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+        const bookings = await bookingsCollection.find({}).toArray();
+        res.json(bookings);
+      } catch (err) {
+        console.error("Get bookings error:", err);
+        res.status(500).json({ message: "Failed to fetch bookings" });
+      }
+    });
+
     app.put("/api/bookings/:id", verifyToken, async (req, res) => {
       try {
-        const id = req.params.id;
-        const { status } = req.body;
-        if (!["admin", "decorator"].includes(req.user.role)) return res.status(403).send({ message: "Forbidden" });
-        const result = await bookingsCollection.updateOne({ _id: new ObjectId(id) }, { $set: { status } });
-        res.send({ success: result.modifiedCount > 0 });
+        if (!["admin", "decorator"].includes(req.user.role)) return res.status(403).json({ message: "Forbidden" });
+        const result = await bookingsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: req.body });
+        res.json({ success: result.modifiedCount > 0 });
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Update booking error:", err);
+        res.status(500).json({ message: "Failed to update booking" });
       }
     });
 
-    // Delete booking (Admin)
     app.delete("/api/bookings/:id", verifyToken, async (req, res) => {
       try {
-        if (req.user.role !== "admin") return res.status(403).send({ message: "Forbidden" });
-        const id = req.params.id;
-        const result = await bookingsCollection.deleteOne({ _id: new ObjectId(id) });
-        res.send({ success: result.deletedCount > 0 });
+        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+        const result = await bookingsCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: result.deletedCount > 0 });
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Delete booking error:", err);
+        res.status(500).json({ message: "Failed to delete booking" });
       }
     });
 
     // ===== DECORATORS =====
-    // Get all decorators
     app.get("/api/decorators", verifyToken, async (req, res) => {
       try {
-        if (req.user.role !== "admin") return res.status(403).send({ message: "Forbidden" });
+        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
         const decorators = await usersCollection.find({ role: "decorator" }).toArray();
-        res.send(decorators);
+        res.json(decorators);
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Get decorators error:", err);
+        res.status(500).json({ message: "Failed to fetch decorators" });
       }
     });
 
-    // Make user a decorator
     app.put("/api/decorators/:id", verifyToken, async (req, res) => {
       try {
-        if (req.user.role !== "admin") return res.status(403).send({ message: "Forbidden" });
-        const id = req.params.id;
-        const result = await usersCollection.updateOne({ _id: new ObjectId(id) }, { $set: { role: "decorator" } });
-        res.send({ success: result.modifiedCount > 0 });
+        if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+        const result = await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { role: "decorator" } });
+        res.json({ success: result.modifiedCount > 0 });
       } catch (err) {
-        console.error(err);
-        res.status(500).send({ success: false });
+        console.error("Make decorator error:", err);
+        res.status(500).json({ message: "Failed to update user role" });
       }
     });
 
-    // ===== DEFAULT ROUTE =====
+    // ===== DEFAULT =====
     app.get("/", (req, res) => res.send("StyleDecor Backend Running"));
-
   } finally {
-    // Nothing here
+    // client stays connected
   }
 }
 
