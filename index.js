@@ -8,6 +8,9 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const path = require("path");
 const fs = require("fs");
 
+// ✅ Stripe Import (অন্যান্য require এর সাথে রাখা হলো)
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
 const app = express();
 const port = process.env.PORT || 5000;
 
@@ -35,6 +38,11 @@ if (!process.env.JWT_SECRET) {
     "WARNING: Missing JWT_SECRET in .env — generate a long random string for security"
   );
 }
+if (!process.env.STRIPE_SECRET_KEY) {
+  console.warn(
+    "WARNING: Missing STRIPE_SECRET_KEY in .env"
+  );
+}
 
 // Middleware
 app.use(cors());
@@ -51,7 +59,7 @@ const client = new MongoClient(uri, {
   },
 });
 
-let usersCollection, servicesCollection, bookingsCollection;
+let usersCollection, servicesCollection, bookingsCollection, paymentsCollection;
 
 async function run() {
   try {
@@ -62,8 +70,9 @@ async function run() {
     usersCollection = db.collection("users");
     servicesCollection = db.collection("services");
     bookingsCollection = db.collection("bookings");
+    paymentsCollection = db.collection("payments"); // collection initialize
 
-    // ===== AUTH =====
+    // ===== AUTH ROUTES (NO CHANGES REQUIRED) =====
     app.post("/api/auth/register", upload.single("photo"), async (req, res) => {
       try {
         const body = { ...(req.body || {}) };
@@ -208,7 +217,7 @@ async function run() {
       }
     });
 
-    // ===== Middleware =====
+    // ===== Middleware (NO CHANGES REQUIRED) =====
     const verifyToken = (req, res, next) => {
       const authHeader = req.headers.authorization || req.headers.Authorization;
       if (!authHeader) return res.status(401).json({ message: "Unauthorized" });
@@ -235,7 +244,6 @@ async function run() {
         next();
       };
 
-    // Get current logged in user (FIXED: Handles invalid IDs from old tokens)
     app.get("/api/me", verifyToken, async (req, res) => {
       try {
         if (!ObjectId.isValid(req.user.id)) {
@@ -255,9 +263,10 @@ async function run() {
     });
 
 
-    // ===== SERVICES (Existing routes) =====
+    // ===== SERVICES (FIXED /services/:id route) =====
     app.get("/api/services", async (req, res) => {
       try {
+        // Implementation of search, category filter, and sorting logic
         const q = {};
         const { search, category, sort } = req.query;
         if (search)
@@ -279,9 +288,37 @@ async function run() {
         res.status(500).json({ message: "Failed to fetch services" });
       }
     });
-    // [Other service routes like POST, PUT, DELETE are here]
-    
-    app.post(
+    
+   // server.js (আপনার /api/services/:id রুটটি এই অংশ দিয়ে পরিবর্তন করুন)
+
+app.get("/api/services/:id", async (req, res) => {
+    const id = req.params.id;
+    try {
+        let query = {};
+        
+        // ObjectId.isValid চেক করা হচ্ছে (এটি Mongoose বা MongoDB ড্রাইভার থেকে আসে)
+        // যদি এটি সঠিক ObjectId হয়, তবে ObjectId কনস্ট্রাক্টর ব্যবহার করা হবে
+        if (ObjectId.isValid(id)) {
+            query._id = new ObjectId(id);
+        } else {
+            // যদি এটি বৈধ ObjectId না হয় (যেমন, যদি আপনি ভুল করে ID স্ট্রিং হিসেবে সেভ করে থাকেন)
+            query._id = id;
+        }
+
+        // এবার ক্যোয়ারি চালানো হবে
+        const service = await servicesCollection.findOne(query);
+        
+        if (!service) {
+            return res.status(404).json({ message: "Service not found" });
+        }
+        res.json(service);
+    } catch (err) {
+        console.error("Get service details error:", err);
+        res.status(500).json({ message: "Failed to fetch service details" });
+    }
+});
+
+    app.post(
       "/api/services",
       verifyToken,
       requireRole(["admin"]),
@@ -293,6 +330,10 @@ async function run() {
           if (req.file) doc.images = [`/uploads/${req.file.filename}`];
           doc.createdAt = new Date();
           doc.createdBy = req.user.id;
+          // Ensure all required fields are present
+          if (!doc.service_name || !doc.cost || !doc.category || !doc.description) {
+              return res.status(400).json({ message: "Missing required service fields." });
+          }
           const result = await servicesCollection.insertOne(doc);
           res.status(201).json({ success: true, serviceId: result.insertedId });
         } catch (err) {
@@ -301,8 +342,8 @@ async function run() {
         }
       }
     );
-    
-    app.delete(
+    
+    app.delete(
       "/api/services/:id",
       verifyToken,
       requireRole(["admin"]),
@@ -322,61 +363,95 @@ async function run() {
       }
     );
 
-    // ===== BOOKINGS: DECORATOR SPECIFIC ROUTES (NEW) =====
-    
-    // FIX 3: Get bookings assigned to the decorator
-    app.get("/api/bookings/assigned", verifyToken, requireRole(["decorator"]), async (req, res) => {
-        try {
-            // ধরে নেওয়া হচ্ছে বুকিং ডকুমেন্টে 'decoratorId' ফিল্ডে ডেকোরেটরের আইডি আছে
-            const bookings = await bookingsCollection
-                .find({ decoratorId: req.user.id }) 
-                .toArray();
-            res.json(bookings);
-        } catch (err) {
-            console.error("Get decorator assigned bookings error:", err);
-            res.status(500).json({ message: "Failed to fetch assigned bookings" });
-        }
-    });
+    // ===========================================
+    // ===== BOOKINGS & PAYMENTS (NEW ROUTES) =====
+    // ===========================================
 
-    // FIX 4: Update booking status (Accessible by Admin and Decorator)
-    app.put("/api/bookings/:id", verifyToken, async (req, res) => {
-        try {
-            const id = req.params.id;
-            const data = req.body;
-            if (!["admin", "decorator"].includes(req.user.role))
-                return res.status(403).json({ message: "Forbidden" });
-            
-            // ডেকোরেটরের জন্য, শুধুমাত্র status আপডেট করতে দেওয়া উচিত। 
-            // যদি body তে 'status' ছাড়া অন্য কিছু থাকে, সেটি বাদ দেওয়া ভালো।
-            const updateDoc = {};
-            if (data.status) {
-                updateDoc.status = data.status;
-            } else {
-                return res.status(400).json({ message: "Status field is required for update" });
+    // ✅ Stripe Payment Intent Route
+    app.post("/api/create-payment-intent", verifyToken, async (req, res) => {
+        try {
+            const { amount } = req.body;
+            // Stripe expects amount in cents/paisa, so multiply by 100
+            const amountInCents = parseInt(amount * 100);
+
+            if (isNaN(amountInCents) || amountInCents <= 0) {
+                return res.status(400).json({ message: "Invalid amount" });
+            }
+
+            const paymentIntent = await stripe.paymentIntents.create({
+                amount: amountInCents,
+                currency: "bdt", // BDT supported by Stripe for cards
+                payment_method_types: ['card'],
+            });
+
+            res.send({
+                clientSecret: paymentIntent.client_secret,
+            });
+        } catch (err) {
+            console.error("Stripe payment intent creation failed:", err);
+            res.status(500).json({ message: "Failed to create payment intent" });
+        }
+    });
+    
+    // ✅ Handle Payment Confirmation and Booking Update
+    app.post("/api/payments", verifyToken, async (req, res) => {
+        try {
+            const { bookingId, transactionId, amount, currency } = req.body;
+
+            // Basic Validation
+            if (!bookingId || !transactionId || !amount) {
+                return res.status(400).json({ message: "Missing required payment data." });
             }
 
-            const result = await bookingsCollection.updateOne(
-                { _id: new ObjectId(id) },
-                { $set: updateDoc }
-            );
-            res.json({ success: result.modifiedCount > 0 });
-        } catch (err) {
-            console.error("Update booking error:", err);
-            res.status(500).json({ message: "Failed to update booking" });
-        }
-    });
+            if (!ObjectId.isValid(bookingId)) {
+                return res.status(400).json({ message: "Invalid booking ID." });
+            }
+
+            const paymentData = {
+                bookingId,
+                transactionId,
+                amount: parseFloat(amount),
+                currency: currency || "bdt",
+                userId: req.user.id,
+                userEmail: req.user.email,
+                paymentDate: new Date(),
+            };
+            
+            // 1. Save payment record
+            const result = await paymentsCollection.insertOne(paymentData);
+            
+            // 2. Update booking status
+            await bookingsCollection.updateOne(
+                { _id: new ObjectId(bookingId) },
+                { $set: { paymentStatus: "completed", status: "Planning Phase", transactionId: transactionId } }
+            );
+
+            res.status(201).json({ success: true, paymentId: result.insertedId });
+        } catch (err) {
+            console.error("Payment processing error:", err);
+            res.status(500).json({ message: "Payment failed" });
+        }
+    });
     
-    // [Other booking routes are here]
-    app.post("/api/bookings", verifyToken, async (req, res) => {
+    // ✅ Create Booking (Added decoratorId: null for initial state)
+    app.post("/api/bookings", verifyToken, async (req, res) => {
       try {
         const booking = {
           ...req.body,
           userId: req.user.id,
           userEmail: req.user.email,
-          status: "Assigned",
+          userName: req.user.name, 
+          status: "Pending", // Initial status: Pending (Waiting for Admin review/assignment)
+          decoratorId: null, 
           paymentStatus: "pending",
           createdAt: new Date(),
         };
+          // Validation for essential fields for a new booking
+          if (!booking.serviceId || !booking.date || !booking.location || !booking.cost) {
+              return res.status(400).json({ message: "Missing required booking fields (serviceId, date, location, cost)." });
+          }
+          booking.cost = parseFloat(booking.cost); // Ensure cost is a number
+
         const result = await bookingsCollection.insertOne(booking);
         res.status(201).json({ success: true, bookingId: result.insertedId });
       } catch (err) {
@@ -397,21 +472,53 @@ async function run() {
       }
     });
 
-    app.get("/api/bookings/my/:userId", verifyToken, async (req, res) => {
-      try {
-        const { userId } = req.params;
-        if (
-          req.user.id !== userId &&
-          req.user.role !== "admin" &&
-          req.user.role !== "decorator"
-        )
-          return res.status(403).json({ message: "Forbidden" });
-        const bookings = await bookingsCollection.find({ userId }).toArray();
-        res.json(bookings);
-      } catch (err) {
-        console.error("Get user bookings by id error:", err);
-        res.status(500).json({ message: "Failed to fetch user bookings" });
-      }
+    // ✅ Get bookings assigned to the decorator (FIXED: Uses string ID)
+    app.get("/api/bookings/assigned", verifyToken, requireRole(["decorator"]), async (req, res) => {
+        try {
+            const bookings = await bookingsCollection
+                .find({ decoratorId: req.user.id }) // req.user.id is the string ID
+                .toArray();
+            res.json(bookings);
+        } catch (err) {
+            console.error("Get decorator assigned bookings error:", err);
+            res.status(500).json({ message: "Failed to fetch assigned bookings" });
+        }
+    });
+    
+    // ✅ Update booking status (Accessible by Admin and Decorator)
+    app.put("/api/bookings/:id", verifyToken, async (req, res) => {
+        try {
+            const id = req.params.id;
+            const data = req.body;
+            
+            // Authorization Check
+            const allowedRoles = ["admin", "decorator"];
+            if (!allowedRoles.includes(req.user.role)) {
+                return res.status(403).json({ message: "Forbidden: Only Admin/Decorator can update status" });
+            }
+            
+            // Input Validation
+            const updateDoc = {};
+            if (data.status) {
+                updateDoc.status = data.status;
+            } else {
+                return res.status(400).json({ message: "Status field is required for update" });
+            }
+            
+            // Check if ID is valid
+            if (!ObjectId.isValid(id)) {
+                return res.status(400).json({ message: "Invalid booking ID" });
+            }
+
+            const result = await bookingsCollection.updateOne(
+                { _id: new ObjectId(id) },
+                { $set: updateDoc }
+            );
+            res.json({ success: result.modifiedCount > 0 });
+        } catch (err) {
+            console.error("Update booking error:", err);
+            res.status(500).json({ message: "Failed to update booking" });
+        }
     });
 
     app.get(
@@ -449,7 +556,34 @@ async function run() {
       }
     });
 
-    // ===== DECORATORS & USERS (Existing routes) =====
+
+    // ===== DECORATORS & USERS (Added Admin Assign Decorator Route) =====
+    
+    // ✅ Admin Assign Decorator to Booking (NEW)
+    app.put("/api/bookings/assign/:id", verifyToken, requireRole(["admin"]), async (req, res) => {
+        try {
+            const id = req.params.id;
+            const { decoratorId } = req.body;
+            
+            // decoratorId should be the string ID from the users collection
+            if (!ObjectId.isValid(id) || !decoratorId || decoratorId.length !== 24) {
+                return res.status(400).json({ message: "Invalid Booking ID or Decorator ID" });
+            }
+
+            const result = await bookingsCollection.updateOne(
+                { _id: new ObjectId(id) },
+                { $set: { decoratorId: decoratorId, status: "Assigned" } } // Assigned status
+            );
+
+            res.json({ success: result.modifiedCount > 0 });
+
+        } catch (err) {
+            console.error("Assign decorator error:", err);
+            res.status(500).json({ message: "Failed to assign decorator" });
+        }
+    });
+
+    // [Other user/decorator routes remain the same]
     app.get(
       "/api/decorators",
       verifyToken,
@@ -486,8 +620,8 @@ async function run() {
         }
       }
     );
-    
-    app.get(
+    
+    app.get(
       "/api/users",
       verifyToken,
       requireRole(["admin"]),
@@ -504,8 +638,8 @@ async function run() {
         }
       }
     );
-    
-    app.put(
+    
+    app.put(
       "/api/users/:id/role",
       verifyToken,
       requireRole(["admin"]),
@@ -527,7 +661,7 @@ async function run() {
       }
     );
 
-    // ===== DEFAULT =====
+    // ===== DEFAULT (NO CHANGES REQUIRED) =====
     app.get("/", (req, res) => res.send("StyleDecor Backend Running"));
   } finally {
     // keep DB connection open
