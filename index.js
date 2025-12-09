@@ -146,6 +146,8 @@ async function run() {
         console.error("Google login error:", err);
         res.status(500).json({ message: "Google login failed" });
       }
+      console.log("GOOGLE LOGIN RESPONSE:", res.data);
+
     });
 
     // ===== Middleware =====
