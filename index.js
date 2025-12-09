@@ -1,3 +1,4 @@
+// server.js
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
@@ -24,7 +25,6 @@ const storage = multer.diskStorage({
   },
 });
 const upload = multer({ storage });
-
 
 if (!process.env.DB_USER || !process.env.DB_PASS || !process.env.DB_NAME) {
   console.warn("WARNING: Missing DB credentials (DB_USER, DB_PASS, DB_NAME) in .env");
@@ -57,9 +57,11 @@ async function run() {
     bookingsCollection = db.collection("bookings");
 
     // ===== AUTH =====
-    app.post("/api/auth/register", async (req, res) => {
+    app.post("/api/auth/register", upload.single("photo"), async (req, res) => {
       try {
-        const { name, email, password } = req.body;
+        const body = { ...(req.body || {}) };
+        const { name, email, password } = body;
+
         if (!name || !email || !password)
           return res.status(400).json({ message: "Name, email and password are required" });
 
@@ -67,7 +69,23 @@ async function run() {
         if (exists) return res.status(400).json({ message: "User already exists" });
 
         const hashedPassword = await bcrypt.hash(password, 10);
-        const newUser = { name, email, password: hashedPassword, role: "user", createdAt: new Date() };
+
+        let photoUrl = null;
+        if (req.file) {
+          photoUrl = `/uploads/${req.file.filename}`;
+        } else if (body.photo) {
+          photoUrl = body.photo;
+        }
+
+        const newUser = {
+          name,
+          email,
+          password: hashedPassword,
+          role: "user",
+          photo: photoUrl,
+          createdAt: new Date(),
+        };
+
         const result = await usersCollection.insertOne(newUser);
 
         const insertedUser = await usersCollection.findOne(
@@ -76,7 +94,12 @@ async function run() {
         );
 
         const token = jwt.sign(
-          { id: insertedUser._id.toString(), email: insertedUser.email, role: insertedUser.role, name: insertedUser.name },
+          {
+            id: insertedUser._id.toString(),
+            email: insertedUser.email,
+            role: insertedUser.role,
+            name: insertedUser.name,
+          },
           process.env.JWT_SECRET,
           { expiresIn: "7d" }
         );
@@ -127,7 +150,15 @@ async function run() {
         if (!user) {
           const randomSeed = uid || Math.random().toString(36).slice(2, 10);
           const tempPasswordHash = await bcrypt.hash(randomSeed, 10);
-          const doc = { name: name || "Google User", email, password: tempPasswordHash, role: "user", googleId: uid || null, photo: photo || null, createdAt: new Date() };
+          const doc = {
+            name: name || "Google User",
+            email,
+            password: tempPasswordHash,
+            role: "user",
+            googleId: uid || null,
+            photo: photo || null,
+            createdAt: new Date(),
+          };
           const insertRes = await usersCollection.insertOne(doc);
           user = await usersCollection.findOne({ _id: insertRes.insertedId }, { projection: { password: 0 } });
         } else {
@@ -146,8 +177,6 @@ async function run() {
         console.error("Google login error:", err);
         res.status(500).json({ message: "Google login failed" });
       }
-      console.log("GOOGLE LOGIN RESPONSE:", res.data);
-
     });
 
     // ===== Middleware =====
@@ -173,6 +202,18 @@ async function run() {
       if (!allowedRoles.includes(req.user.role)) return res.status(403).json({ message: "Forbidden" });
       next();
     };
+
+    // ===== ADMIN: list all users (added so admin can manage users) =====
+    // GET /api/users  (admin only)
+    app.get("/api/users", verifyToken, requireRole(["admin"]), async (req, res) => {
+      try {
+        const users = await usersCollection.find().project({ password: 0 }).toArray();
+        res.json(users);
+      } catch (err) {
+        console.error("Get users error:", err);
+        res.status(500).json({ message: "Failed to fetch users" });
+      }
+    });
 
     // ===== SERVICES =====
     app.get("/api/services", async (req, res) => {
@@ -215,7 +256,8 @@ async function run() {
     app.post("/api/services", verifyToken, requireRole(["admin"]), upload.single("photo"), async (req, res) => {
       try {
         const doc = req.body;
-        if (req.file) doc.images = [ `/uploads/${req.file.filename}` ]
+        if (doc.cost) doc.cost = parseFloat(doc.cost);
+        if (req.file) doc.images = [ `/uploads/${req.file.filename}` ];
         doc.createdAt = new Date();
         doc.createdBy = req.user.id;
         const result = await servicesCollection.insertOne(doc);
@@ -344,6 +386,21 @@ async function run() {
       }
     });
 
+    // Generic role update (admin)
+    app.put("/api/users/:id/role", verifyToken, requireRole(["admin"]), async (req, res) => {
+      try {
+        const id = req.params.id;
+        const { role } = req.body;
+        if (!["user", "decorator", "admin"].includes(role)) return res.status(400).json({ message: "Invalid role" });
+        const result = await usersCollection.updateOne({ _id: new ObjectId(id) }, { $set: { role } });
+        res.json({ success: result.modifiedCount > 0 });
+      } catch (err) {
+        console.error("Update user role error:", err);
+        res.status(500).json({ message: "Failed to update user role" });
+      }
+    });
+
+    // Get current logged in user
     app.get("/api/me", verifyToken, async (req, res) => {
       try {
         const user = await usersCollection.findOne({ _id: new ObjectId(req.user.id) }, { projection: { password: 0 } });
@@ -359,7 +416,7 @@ async function run() {
     app.get("/", (req, res) => res.send("StyleDecor Backend Running"));
 
   } finally {
-   
+    // keep DB connection open
   }
 }
 
