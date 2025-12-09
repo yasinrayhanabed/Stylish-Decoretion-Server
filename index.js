@@ -213,7 +213,7 @@ async function run() {
     app.post("/api/services", verifyToken, requireRole(["admin"]), upload.single("photo"), async (req, res) => {
       try {
         const doc = req.body;
-        if (req.file) doc.photo = `/uploads/${req.file.filename}`; // photo path
+        if (req.file) doc.images = [ `/uploads/${req.file.filename}` ]
         doc.createdAt = new Date();
         doc.createdBy = req.user.id;
         const result = await servicesCollection.insertOne(doc);
