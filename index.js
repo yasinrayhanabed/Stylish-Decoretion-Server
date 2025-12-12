@@ -267,6 +267,42 @@ async function run() {
             }
         });
 
+        app.put("/api/users/profile", verifyToken, async (req, res) => {
+            try {
+                const { name, phone, address } = req.body;
+                
+                if (!name) {
+                    return res.status(400).json({ message: "Name is required" });
+                }
+
+                const updateData = {
+                    name,
+                    phone: phone || null,
+                    address: address || null,
+                    updatedAt: new Date()
+                };
+
+                const result = await usersCollection.updateOne(
+                    { _id: new ObjectId(req.user.id) },
+                    { $set: updateData }
+                );
+
+                if (result.modifiedCount === 0) {
+                    return res.status(404).json({ message: "User not found or no changes made" });
+                }
+
+                const updatedUser = await usersCollection.findOne(
+                    { _id: new ObjectId(req.user.id) },
+                    { projection: { password: 0 } }
+                );
+
+                res.json({ message: "Profile updated successfully", user: updatedUser });
+            } catch (err) {
+                console.error("Update profile error:", err);
+                res.status(500).json({ message: "Failed to update profile" });
+            }
+        });
+
         app.get("/api/services", async (req, res) => {
             try {
                 const q = {};
@@ -411,7 +447,7 @@ async function run() {
                 // Update booking status
                 await bookingsCollection.updateOne(
                     { _id: new ObjectId(bookingId) },
-                    { $set: { paymentStatus: "completed", status: "Planning Phase", transactionId: transactionId } }
+                    { $set: { paymentStatus: "completed", status: "Completed", transactionId: transactionId } }
                 );
 
                 res.status(201).json({ success: true, paymentId: result.insertedId });
@@ -744,6 +780,22 @@ async function run() {
                 res.status(500).json({ message: "Failed to update user role" });
             }
         });
+
+        // --- Migration: Update old paid bookings to Completed status ---
+        try {
+            const result = await bookingsCollection.updateMany(
+                { 
+                    paymentStatus: "completed", 
+                    status: { $in: ["Planning Phase", "Assigned"] } 
+                },
+                { $set: { status: "Completed" } }
+            );
+            if (result.modifiedCount > 0) {
+                console.log(`Updated ${result.modifiedCount} paid bookings to Completed status`);
+            }
+        } catch (err) {
+            console.error("Migration error:", err);
+        }
 
         // --- Final Check ---
         await client.db("admin").command({ ping: 1 });
