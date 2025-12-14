@@ -260,7 +260,15 @@ async function run() {
                     { projection: { password: 0 } }
                 );
                 if (!user) return res.status(404).json({ message: "User not found" });
-                res.json(user);
+                
+                // Include decorator request status and data
+                const responseUser = {
+                    ...user,
+                    decoratorRequestStatus: user.decoratorRequestStatus || null,
+                    decoratorRequest: user.decoratorRequest || null
+                };
+                
+                res.json(responseUser);
             } catch (err) {
                 console.error("Get me error:", err);
                 res.status(500).json({ message: "Failed to fetch user" });
@@ -609,7 +617,7 @@ async function run() {
             }
         });
 
-        // 6. Update booking status (Admin/Decorator)
+        // 6. Update booking (Admin/Decorator) - for decorator assignment and status updates
         app.put("/api/bookings/:id", verifyToken, requireRole(["admin", "decorator"]), async (req, res) => {
             try {
                 const id = req.params.id;
@@ -620,17 +628,33 @@ async function run() {
                 }
 
                 const updateDoc = {};
+                
+                // Handle decorator assignment
+                if (data.assignedDecorator) {
+                    updateDoc.assignedDecorator = data.assignedDecorator;
+                    updateDoc.decoratorId = data.assignedDecorator; // Keep both for compatibility
+                }
+                
+                // Handle status update
                 if (data.status) {
                     updateDoc.status = data.status;
-                } else {
-                    return res.status(400).json({ message: "Status field is required for update" });
                 }
+                
+                // Add updated timestamp
+                updateDoc.updatedAt = new Date();
                 
                 const result = await bookingsCollection.updateOne(
                     { _id: new ObjectId(id) },
                     { $set: updateDoc }
                 );
-                res.json({ success: result.modifiedCount > 0 });
+                
+                if (result.modifiedCount > 0) {
+                    // Return the updated booking
+                    const updatedBooking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+                    res.json(updatedBooking);
+                } else {
+                    res.status(404).json({ message: "Booking not found or no changes made" });
+                }
             } catch (err) {
                 console.error("Update booking error:", err);
                 res.status(500).json({ message: "Failed to update booking" });
@@ -667,6 +691,60 @@ async function run() {
             }
         });
         
+        // 7a. Update booking status only
+        app.put("/api/bookings/:id/status", verifyToken, requireRole(["admin", "decorator"]), async (req, res) => {
+            try {
+                const id = req.params.id;
+                const { status } = req.body;
+                
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).json({ message: "Invalid booking ID" });
+                }
+                
+                if (!status) {
+                    return res.status(400).json({ message: "Status is required" });
+                }
+                
+                const result = await bookingsCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { status: status, updatedAt: new Date() } }
+                );
+                
+                res.json({ success: result.modifiedCount > 0, message: "Status updated" });
+            } catch (err) {
+                console.error("Update booking status error:", err);
+                res.status(500).json({ message: "Failed to update booking status" });
+            }
+        });
+        
+        // 7b. Update payment status
+        app.put("/api/bookings/:id/payment", verifyToken, requireRole(["admin"]), async (req, res) => {
+            try {
+                const id = req.params.id;
+                const { isPaid } = req.body;
+                
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).json({ message: "Invalid booking ID" });
+                }
+                
+                const updateDoc = {
+                    isPaid: isPaid,
+                    paymentStatus: isPaid ? 'completed' : 'pending',
+                    updatedAt: new Date()
+                };
+                
+                const result = await bookingsCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: updateDoc }
+                );
+                
+                res.json({ success: result.modifiedCount > 0, message: "Payment status updated" });
+            } catch (err) {
+                console.error("Update payment status error:", err);
+                res.status(500).json({ message: "Failed to update payment status" });
+            }
+        });
+
         // 8. Admin: Assign decorator to a booking
         app.put("/api/bookings/assign/:id", verifyToken, requireRole(["admin"]), async (req, res) => {
             try {
@@ -679,7 +757,7 @@ async function run() {
 
                 const result = await bookingsCollection.updateOne(
                     { _id: new ObjectId(id) },
-                    { $set: { decoratorId: decoratorId, status: "Assigned" } }
+                    { $set: { decoratorId: decoratorId, assignedDecorator: decoratorId, status: "Assigned", updatedAt: new Date() } }
                 );
 
                 res.json({ success: result.modifiedCount > 0 });
@@ -727,6 +805,146 @@ async function run() {
             }
         );
         
+        // Decorator request routes
+        app.post("/api/decorator-requests", verifyToken, async (req, res) => {
+            try {
+                const { experience, specialty, portfolio, description, phone, location, expectedRate } = req.body;
+                
+                if (!experience || !specialty || !description || !phone || !location) {
+                    return res.status(400).json({ message: "Missing required fields" });
+                }
+                
+                const decoratorRequest = {
+                    userId: req.user.id,
+                    userName: req.user.name,
+                    userEmail: req.user.email,
+                    experience,
+                    specialty,
+                    portfolio: portfolio || null,
+                    description,
+                    phone,
+                    location,
+                    expectedRate: expectedRate ? parseFloat(expectedRate) : null,
+                    status: 'pending',
+                    createdAt: new Date()
+                };
+                
+                // Check if user already has a pending request
+                const existingRequest = await usersCollection.findOne({
+                    _id: new ObjectId(req.user.id),
+                    decoratorRequestStatus: 'pending'
+                });
+                
+                if (existingRequest) {
+                    return res.status(400).json({ message: "You already have a pending decorator request" });
+                }
+                
+                // Add decorator request info to user document
+                await usersCollection.updateOne(
+                    { _id: new ObjectId(req.user.id) },
+                    { 
+                        $set: { 
+                            decoratorRequest: decoratorRequest,
+                            decoratorRequestStatus: 'pending',
+                            updatedAt: new Date()
+                        } 
+                    }
+                );
+                
+                res.status(201).json({ 
+                    success: true, 
+                    message: "Decorator request submitted successfully! We will review and contact you soon."
+                });
+                
+            } catch (err) {
+                console.error("Decorator request error:", err);
+                res.status(500).json({ message: "Failed to submit decorator request" });
+            }
+        });
+        
+        // Get all decorator requests (Admin only)
+        app.get("/api/decorator-requests", verifyToken, requireRole(["admin"]), async (req, res) => {
+            try {
+                const users = await usersCollection.find({ 
+                    decoratorRequestStatus: { $exists: true } 
+                }).project({ password: 0 }).toArray();
+                
+                // Transform data to match frontend expectations
+                const requests = users.map(user => ({
+                    _id: user._id,
+                    user: {
+                        name: user.name,
+                        email: user.email
+                    },
+                    experience: user.decoratorRequest?.experience || 'Not specified',
+                    specialty: user.decoratorRequest?.specialty || 'Not specified',
+                    phone: user.decoratorRequest?.phone || 'Not provided',
+                    location: user.decoratorRequest?.location || 'Not specified',
+                    expectedRate: user.decoratorRequest?.expectedRate || null,
+                    portfolio: user.decoratorRequest?.portfolio || null,
+                    description: user.decoratorRequest?.description || 'No description provided',
+                    status: user.decoratorRequestStatus || 'pending',
+                    createdAt: user.decoratorRequest?.createdAt || user.createdAt
+                }));
+                
+                res.json(requests);
+            } catch (err) {
+                console.error("Get decorator requests error:", err);
+                res.status(500).json({ message: "Failed to fetch decorator requests" });
+            }
+        });
+        
+        // Approve decorator request
+        app.put("/api/decorator-requests/:id/approve", verifyToken, requireRole(["admin"]), async (req, res) => {
+            try {
+                const userId = req.params.id;
+                if (!ObjectId.isValid(userId)) {
+                    return res.status(400).json({ message: "Invalid user ID" });
+                }
+                
+                const result = await usersCollection.updateOne(
+                    { _id: new ObjectId(userId) },
+                    { 
+                        $set: { 
+                            role: "decorator",
+                            decoratorRequestStatus: "approved",
+                            updatedAt: new Date()
+                        } 
+                    }
+                );
+                
+                res.json({ success: result.modifiedCount > 0 });
+            } catch (err) {
+                console.error("Approve decorator request error:", err);
+                res.status(500).json({ message: "Failed to approve decorator request" });
+            }
+        });
+        
+        // Reject decorator request
+        app.put("/api/decorator-requests/:id/reject", verifyToken, requireRole(["admin"]), async (req, res) => {
+            try {
+                const userId = req.params.id;
+                if (!ObjectId.isValid(userId)) {
+                    return res.status(400).json({ message: "Invalid user ID" });
+                }
+                
+                const result = await usersCollection.updateOne(
+                    { _id: new ObjectId(userId) },
+                    { 
+                        $set: { 
+                            decoratorRequestStatus: "rejected",
+                            updatedAt: new Date()
+                        } 
+                    }
+                );
+                
+                res.json({ success: result.modifiedCount > 0 });
+            } catch (err) {
+                console.error("Reject decorator request error:", err);
+                res.status(500).json({ message: "Failed to reject decorator request" });
+            }
+        });
+
         // Get decorators and users
         app.get("/api/decorators", verifyToken, requireRole(["admin"]), async (req, res) => {
             try {
