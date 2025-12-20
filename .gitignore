@@ -1,3 +1,13 @@
-node modules
+
+# Node dependencies
+node_modules/
+
+# Environment variables
 .env
-.vercel
+.env.*
+
+# Vercel deployment output
+.vercel/
+
+# Service account keys and other secrets
+*.json

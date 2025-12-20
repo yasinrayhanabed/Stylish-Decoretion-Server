@@ -27,6 +27,14 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
+const client = new MongoClient(process.env.DB_URI, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
+});
+
 // --- Cloudinary Config ---
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -48,14 +56,6 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.use(express.json());
-
-const client = new MongoClient(process.env.DB_URI, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
 
 let usersCollection, servicesCollection, bookingsCollection, paymentsCollection;
 
@@ -125,11 +125,11 @@ async function run() {
           let dataURI = "data:" + req.file.mimetype + ";base64," + b64;
 
           try {
-            const res = await cloudinary.uploader.upload(dataURI, {
+            const uploadResponse = await cloudinary.uploader.upload(dataURI, {
               resource_type: "auto",
               folder: "stylish-decor/avatars",
             });
-            photoUrl = res.secure_url;
+            photoUrl = uploadResponse.secure_url;
           } catch (uploadError) {
             console.error(
               "Cloudinary upload failed during registration:",
@@ -164,6 +164,7 @@ async function run() {
         );
         res.status(201).json({ token, user: insertedUser });
       } catch (err) {
+        console.error("Registration failed:", err);
         res.status(500).json({ message: "Registration failed" });
       }
     });
@@ -202,6 +203,7 @@ async function run() {
 
         res.json({ token, user: safeUser });
       } catch (err) {
+        console.error("Login failed:", err);
         res.status(500).json({ message: "Login failed" });
       }
     });
@@ -249,12 +251,13 @@ async function run() {
 
         res.json({ token, user });
       } catch (err) {
+        console.error("Google login failed:", err);
         res.status(500).json({ message: "Google login failed" });
       }
     });
 
     // -------------------------------------------------------------
-    // --- USER & SERVICE ROUTES ---
+    // --- USER ROUTES ---
     // -------------------------------------------------------------
 
     app.get("/api/me", verifyToken, async (req, res) => {
@@ -269,7 +272,6 @@ async function run() {
         );
         if (!user) return res.status(404).json({ message: "User not found" });
 
-        // Include decorator request status and data
         const responseUser = {
           ...user,
           decoratorRequestStatus: user.decoratorRequestStatus || null,
@@ -278,6 +280,7 @@ async function run() {
 
         res.json(responseUser);
       } catch (err) {
+        console.error("Failed to fetch user:", err);
         res.status(500).json({ message: "Failed to fetch user" });
       }
     });
@@ -288,6 +291,9 @@ async function run() {
 
         if (!name) {
           return res.status(400).json({ message: "Name is required" });
+        }
+        if (!ObjectId.isValid(req.user.id)) {
+          return res.status(400).json({ message: "Invalid user ID" });
         }
 
         const updateData = {
@@ -302,10 +308,8 @@ async function run() {
           { $set: updateData }
         );
 
-        if (result.modifiedCount === 0) {
-          return res
-            .status(404)
-            .json({ message: "User not found or no changes made" });
+        if (result.modifiedCount === 0 && result.matchedCount === 0) {
+          return res.status(404).json({ message: "User not found" });
         }
 
         const updatedUser = await usersCollection.findOne(
@@ -318,164 +322,209 @@ async function run() {
           user: updatedUser,
         });
       } catch (err) {
+        console.error("Failed to update profile:", err);
         res.status(500).json({ message: "Failed to update profile" });
       }
     });
 
-    app.get("/api/services", async (req, res) => {
-      try {
-        const q = {};
-        const { search, category, sort } = req.query;
-        if (search)
-          q.$or = [
-            { service_name: { $regex: search, $options: "i" } },
-            { description: { $regex: search, $options: "i" } },
-            { category: { $regex: search, $options: "i" } },
-          ];
-        if (category) q.category = category;
+    // -------------------------------------------------------------
+    // --- SERVICE ROUTES (RE-ORDERED FOR CORRECTNESS) ---
+    // -------------------------------------------------------------
 
-        let cursor = servicesCollection.find(q);
-        if (sort === "cost_asc") cursor = cursor.sort({ cost: 1 });
-        if (sort === "cost_desc") cursor = cursor.sort({ cost: -1 });
+    // GET all services (public)
+   // -------------------------------------------------------------
+// --- SERVICE ROUTES (FIXED & SAFE) ---
+// -------------------------------------------------------------
 
-        const services = await cursor.toArray();
-        res.json(services);
-      } catch (err) {
-        res.status(500).json({ message: "Failed to fetch services" });
+// GET all services (public)
+app.get("/api/services", async (req, res) => {
+  try {
+    const q = {};
+    const { search, category, sort } = req.query;
+
+    if (search) {
+      q.$or = [
+        { service_name: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    if (category) q.category = category;
+
+    let cursor = servicesCollection.find(q);
+
+    if (sort === "cost_asc") cursor = cursor.sort({ cost: 1 });
+    if (sort === "cost_desc") cursor = cursor.sort({ cost: -1 });
+
+    const services = await cursor.toArray();
+    res.json(services);
+  } catch (err) {
+    console.error("Failed to fetch services:", err);
+    res.status(500).json({ message: "Failed to fetch services" });
+  }
+});
+
+// CREATE service (admin only)
+app.post(
+  "/api/services",
+  verifyToken,
+  requireRole(["admin"]),
+  upload.single("photo"),
+  async (req, res) => {
+    try {
+      const doc = { ...req.body };
+
+      // 🔥 VERY IMPORTANT — prevent string _id
+      delete doc._id;
+
+      if (doc.cost) doc.cost = parseFloat(doc.cost);
+
+      if (
+        !doc.service_name ||
+        !doc.cost ||
+        !doc.category ||
+        !doc.description
+      ) {
+        return res
+          .status(400)
+          .json({ message: "Missing required service fields" });
       }
-    });
 
-    app.get("/api/services/:id", async (req, res) => {
-      const id = req.params.id;
-      try {
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).json({ message: "Invalid service ID format" });
-        }
-        const service = await servicesCollection.findOne({
-          _id: new ObjectId(id),
+      if (req.file) {
+        const b64 = Buffer.from(req.file.buffer).toString("base64");
+        const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+
+        const uploadRes = await cloudinary.uploader.upload(dataURI, {
+          folder: "stylish-decor/services",
         });
 
-        if (!service) {
-          return res.status(404).json({ message: "Service not found" });
-        }
-        res.json(service);
-      } catch (err) {
-        res.status(500).json({ message: "Failed to fetch service details" });
+        doc.images = [uploadRes.secure_url];
       }
-    });
 
-    app.post(
-      "/api/services",
-      verifyToken,
-      requireRole(["admin"]),
-      upload.single("photo"),
-      async (req, res) => {
-        try {
-          const doc = req.body;
-          if (doc.cost) doc.cost = parseFloat(doc.cost);
+      doc.createdAt = new Date();
+      doc.createdBy = new ObjectId(req.user.id);
 
-          if (req.file) {
-            const b64 = Buffer.from(req.file.buffer).toString("base64");
-            let dataURI = "data:" + req.file.mimetype + ";base64," + b64;
-            try {
-              const res = await cloudinary.uploader.upload(dataURI, {
-                resource_type: "auto",
-                folder: "stylish-decor/services",
-              });
-              doc.images = [res.secure_url];
-            } catch (uploadError) {
-              return res
-                .status(500)
-                .json({ message: "Image upload to Cloudinary failed." });
-            }
-          }
-          doc.createdAt = new Date();
-          doc.createdBy = req.user.id;
-          if (
-            !doc.service_name ||
-            !doc.cost ||
-            !doc.category ||
-            !doc.description
-          ) {
-            return res
-              .status(400)
-              .json({ message: "Missing required service fields." });
-          }
-          const result = await servicesCollection.insertOne(doc);
-          res.status(201).json({ success: true, serviceId: result.insertedId });
-        } catch (err) {
-          res.status(500).json({ message: "Failed to create service" });
-        }
+      const result = await servicesCollection.insertOne(doc);
+      res.status(201).json({
+        success: true,
+        serviceId: result.insertedId,
+      });
+    } catch (err) {
+      console.error("Failed to create service:", err);
+      res.status(500).json({ message: "Failed to create service" });
+    }
+  }
+);
+
+// GET single service (BACKWARD COMPATIBLE)
+app.get("/api/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    let query;
+    if (ObjectId.isValid(id)) {
+      query = { $or: [{ _id: new ObjectId(id) }, { _id: id }] };
+    } else {
+      query = { _id: id };
+    }
+
+    const service = await servicesCollection.findOne(query);
+
+    if (!service) {
+      return res.status(404).json({ message: "Service not found" });
+    }
+
+    res.json(service);
+  } catch (err) {
+    console.error("Failed to fetch service:", err);
+    res.status(500).json({ message: "Failed to fetch service" });
+  }
+});
+
+// UPDATE service
+app.put(
+  "/api/services/:id",
+  verifyToken,
+  requireRole(["admin"]),
+  upload.single("photo"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid service ID" });
       }
-    );
 
-    app.put(
-      "/api/services/:id",
-      verifyToken,
-      requireRole(["admin"]),
-      upload.single("photo"),
-      async (req, res) => {
-        try {
-          const { id } = req.params;
-          if (!ObjectId.isValid(id)) {
-            return res.status(400).json({ message: "Invalid service ID" });
-          }
+      const updateData = { ...req.body };
+      delete updateData._id;
 
-          const updateData = { ...req.body };
-
-          if (updateData.cost) {
-            updateData.cost = parseFloat(updateData.cost);
-          }
-          if (req.file) {
-            const b64 = Buffer.from(req.file.buffer).toString("base64");
-            let dataURI = "data:" + req.file.mimetype + ";base64," + b64;
-            try {
-              const res = await cloudinary.uploader.upload(dataURI, {
-                resource_type: "auto",
-                folder: "stylish-decor/services",
-              });
-              updateData.images = [res.secure_url];
-            } catch (uploadError) {
-              // Don't fail the whole update if image upload fails, but log it.
-              // Or return an error if image is mandatory.
-              console.error("Cloudinary upload failed on update:", uploadError);
-            }
-          }
-          updateData.updatedAt = new Date();
-
-          const result = await servicesCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: updateData }
-          );
-
-          if (result.matchedCount === 0)
-            return res.status(404).json({ message: "Service not found" });
-
-          res.json({ success: true, message: "Service updated successfully" });
-        } catch (err) {
-          res.status(500).json({ message: "Failed to update service" });
-        }
+      if (updateData.cost) {
+        updateData.cost = parseFloat(updateData.cost);
       }
-    );
 
-    app.delete(
-      "/api/services/:id",
-      verifyToken,
-      requireRole(["admin"]),
-      async (req, res) => {
-        try {
-          const id = req.params.id;
-          if (!ObjectId.isValid(id))
-            return res.status(400).json({ message: "Invalid id" });
-          const result = await servicesCollection.deleteOne({
-            _id: new ObjectId(id),
-          });
-          res.json({ success: result.deletedCount > 0 });
-        } catch (err) {
-          res.status(500).json({ message: "Failed to delete service" });
-        }
+      if (req.file) {
+        const b64 = Buffer.from(req.file.buffer).toString("base64");
+        const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+
+        const uploadRes = await cloudinary.uploader.upload(dataURI, {
+          folder: "stylish-decor/services",
+        });
+
+        updateData.images = [uploadRes.secure_url];
       }
-    );
+
+      updateData.updatedAt = new Date();
+
+      const result = await servicesCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updateData }
+      );
+
+      if (!result.matchedCount) {
+        return res.status(404).json({ message: "Service not found" });
+      }
+
+      const updated = await servicesCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      res.json({ success: true, service: updated });
+    } catch (err) {
+      console.error("Failed to update service:", err);
+      res.status(500).json({ message: "Failed to update service" });
+    }
+  }
+);
+
+// DELETE service
+app.delete(
+  "/api/services/:id",
+  verifyToken,
+  requireRole(["admin"]),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid service ID" });
+      }
+
+      const result = await servicesCollection.deleteOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!result.deletedCount) {
+        return res.status(404).json({ message: "Service not found" });
+      }
+
+      res.json({ success: true, message: "Service deleted successfully" });
+    } catch (err) {
+      console.error("Failed to delete service:", err);
+      res.status(500).json({ message: "Failed to delete service" });
+    }
+  }
+);
 
     // -------------------------------------------------------------
     // --- PAYMENT ROUTES ---
@@ -486,7 +535,8 @@ async function run() {
         const { amount } = req.body;
         const amountInCents = Math.round(amount * 100);
 
-        if (isNaN(amountInCents) || amountInCents <= 50) {
+        if (isNaN(amountInCents) || amountInCents < 50) {
+          // Stripe minimum is ~50 cents
           return res
             .status(400)
             .json({ message: "Invalid amount or amount is too low." });
@@ -502,6 +552,7 @@ async function run() {
           clientSecret: paymentIntent.client_secret,
         });
       } catch (err) {
+        console.error("Failed to create payment intent:", err);
         res.status(500).json({
           message: "Failed to create payment intent on server.",
           errorDetail: err.raw?.message || err.message,
@@ -524,7 +575,7 @@ async function run() {
         }
 
         const paymentData = {
-          bookingId,
+          bookingId: new ObjectId(bookingId),
           transactionId,
           amount: parseFloat(amount),
           currency: currency || "bdt",
@@ -549,16 +600,17 @@ async function run() {
 
         res.status(201).json({ success: true, paymentId: result.insertedId });
       } catch (err) {
+        console.error("Payment processing failed:", err);
         res.status(500).json({ message: "Payment failed" });
       }
     });
 
     app.get("/api/payments/:transactionId", verifyToken, async (req, res) => {
       try {
-        const tId = req.params.transactionId;
+        const { transactionId } = req.params;
 
         const payment = await paymentsCollection.findOne({
-          transactionId: tId,
+          transactionId: transactionId,
           userId: req.user.id,
         });
 
@@ -576,13 +628,9 @@ async function run() {
           );
         }
 
-        const finalData = {
-          ...payment,
-          bookingDetails,
-        };
-
-        res.json(finalData);
+        res.json({ ...payment, bookingDetails });
       } catch (err) {
+        console.error("Failed to fetch payment and booking details:", err);
         res
           .status(500)
           .json({ message: "Failed to fetch payment and booking details." });
@@ -590,10 +638,64 @@ async function run() {
     });
 
     // -------------------------------------------------------------
-    // 🚨 --- BOOKING ROUTES (Routing Order Fixed) --- 🚨
+    // --- BOOKING ROUTES (Correct Routing Order) ---
     // -------------------------------------------------------------
 
-    // 1. Create a new booking
+    // Admin: Get all bookings
+    app.get(
+      "/api/bookings",
+      verifyToken,
+      requireRole(["admin"]),
+      async (req, res) => {
+        try {
+          const bookings = await bookingsCollection
+            .find()
+            .sort({ createdAt: -1 })
+            .toArray();
+          res.json(bookings);
+        } catch (err) {
+          console.error("Failed to fetch all bookings (admin):", err);
+          res.status(500).json({ message: "Failed to fetch bookings" });
+        }
+      }
+    );
+
+    // Get all bookings for the current user (MyBookingsPage)
+    app.get("/api/bookings/my", verifyToken, async (req, res) => {
+      try {
+        const userId = req.user.id;
+        const bookings = await bookingsCollection
+          .find({ userId: userId })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.json(bookings);
+      } catch (err) {
+        console.error("Failed to fetch user bookings:", err);
+        res.status(500).json({ message: "Failed to fetch user bookings" });
+      }
+    });
+
+    // Get all bookings assigned to the decorator
+    app.get(
+      "/api/bookings/assigned",
+      verifyToken,
+      requireRole(["decorator"]),
+      async (req, res) => {
+        try {
+          const bookings = await bookingsCollection
+            .find({ decoratorId: req.user.id })
+            .toArray();
+          res.json(bookings);
+        } catch (err) {
+          console.error("Failed to fetch assigned bookings:", err);
+          res
+            .status(500)
+            .json({ message: "Failed to fetch assigned bookings" });
+        }
+      }
+    );
+
+    // Create a new booking
     app.post(
       "/api/bookings",
       verifyToken,
@@ -639,56 +741,21 @@ async function run() {
           };
 
           const result = await bookingsCollection.insertOne(newBooking);
-          res
-            .status(201)
-            .json({ success: true, bookingId: result.insertedId, newBooking });
+          const createdBooking = await bookingsCollection.findOne({
+            _id: result.insertedId,
+          });
+          res.status(201).json({ success: true, booking: createdBooking });
         } catch (err) {
+          console.error("Failed to create booking:", err);
           res.status(500).json({ message: "Failed to create booking" });
         }
       }
     );
 
-    // 2. 🚨 নির্দিষ্ট রুট আগে: Get all bookings for the current user (MyBookingsPage)
-    app.get("/api/bookings/my", verifyToken, async (req, res) => {
-      try {
-        const userId = req.user.id;
-
-        const bookings = await bookingsCollection
-          .find({
-            userId: userId,
-          })
-          .sort({ createdAt: -1 })
-          .toArray();
-
-        res.json(bookings);
-      } catch (err) {
-        res.status(500).json({ message: "Failed to fetch user bookings" });
-      }
-    });
-
-    // 3. 🚨 নির্দিষ্ট রুট আগে: Get all bookings assigned to the decorator
-    app.get(
-      "/api/bookings/assigned",
-      verifyToken,
-      requireRole(["decorator"]),
-      async (req, res) => {
-        try {
-          const bookings = await bookingsCollection
-            .find({ decoratorId: req.user.id })
-            .toArray();
-          res.json(bookings);
-        } catch (err) {
-          res
-            .status(500)
-            .json({ message: "Failed to fetch assigned bookings" });
-        }
-      }
-    );
-
-    // 4. ডাইনামিক রুট পরে: Get single booking by ID
+    // Get single booking by ID (This must be after other specific GET routes)
     app.get("/api/bookings/:id", verifyToken, async (req, res) => {
       try {
-        const id = req.params.id;
+        const { id } = req.params;
         if (!ObjectId.isValid(id)) {
           return res
             .status(400)
@@ -697,86 +764,62 @@ async function run() {
 
         const booking = await bookingsCollection.findOne({
           _id: new ObjectId(id),
-          $or: [
-            { userId: req.user.id },
-            { status: "Assigned", decoratorId: req.user.id },
-            { "req.user.role": "admin" }, // Note: In MongoDB aggregation, this syntax is wrong, but here it's checking role logic which is handled by verifyToken/requireRole better. Simplified check:
-          ],
         });
 
-        // If the user is admin, they get access regardless of userId/decoratorId
-        if (
-          !booking ||
-          (booking.userId !== req.user.id &&
-            booking.decoratorId !== req.user.id &&
-            req.user.role !== "admin")
-        ) {
-          return res
-            .status(404)
-            .json({ message: "Booking not found or access denied." });
+        if (!booking) {
+          return res.status(404).json({ message: "Booking not found." });
+        }
+
+        // Check for authorization
+        const isOwner = booking.userId === req.user.id;
+        const isAssignedDecorator = booking.decoratorId === req.user.id;
+        const isAdmin = req.user.role === "admin";
+
+        if (!isOwner && !isAssignedDecorator && !isAdmin) {
+          return res.status(403).json({ message: "Access denied." });
         }
 
         res.json(booking);
       } catch (err) {
+        console.error("Failed to fetch booking details:", err);
         res.status(500).json({ message: "Failed to fetch booking details" });
       }
     });
 
-    // 5. Admin: Get all bookings
-    app.get(
-      "/api/bookings",
-      verifyToken,
-      requireRole(["admin"]),
-      async (req, res) => {
-        try {
-          const bookings = await bookingsCollection
-            .find()
-            .sort({ createdAt: -1 })
-            .toArray();
-          res.json(bookings);
-        } catch (err) {
-          res.status(500).json({ message: "Failed to fetch bookings" });
-        }
-      }
-    );
-
-    // 6. Update booking (Admin/Decorator) - for decorator assignment and status updates
+    // Update booking (Admin/Decorator)
     app.put(
       "/api/bookings/:id",
       verifyToken,
       requireRole(["admin", "decorator"]),
       async (req, res) => {
         try {
-          const id = req.params.id;
+          const { id } = req.params;
           const data = req.body;
 
           if (!ObjectId.isValid(id)) {
             return res.status(400).json({ message: "Invalid booking ID" });
           }
 
-          const updateDoc = {};
+          const updateDoc = { $set: { updatedAt: new Date() } };
 
-          // Handle decorator assignment
-          if (data.assignedDecorator) {
-            updateDoc.assignedDecorator = data.assignedDecorator;
-            updateDoc.decoratorId = data.assignedDecorator; // Keep both for compatibility
+          if (req.user.role === "admin" && data.decoratorId) {
+            if (!ObjectId.isValid(data.decoratorId)) {
+              return res.status(400).json({ message: "Invalid decorator ID" });
+            }
+            updateDoc.$set.decoratorId = data.decoratorId;
+            updateDoc.$set.status = "Assigned";
           }
 
-          // Handle status update
           if (data.status) {
-            updateDoc.status = data.status;
+            updateDoc.$set.status = data.status;
           }
-
-          // Add updated timestamp
-          updateDoc.updatedAt = new Date();
 
           const result = await bookingsCollection.updateOne(
             { _id: new ObjectId(id) },
-            { $set: updateDoc }
+            updateDoc
           );
 
-          if (result.modifiedCount > 0) {
-            // Return the updated booking
+          if (result.matchedCount > 0) {
             const updatedBooking = await bookingsCollection.findOne({
               _id: new ObjectId(id),
             });
@@ -787,15 +830,16 @@ async function run() {
               .json({ message: "Booking not found or no changes made" });
           }
         } catch (err) {
+          console.error("Failed to update booking:", err);
           res.status(500).json({ message: "Failed to update booking" });
         }
       }
     );
 
-    // 7. Delete/Cancel booking
+    // Delete/Cancel booking
     app.delete("/api/bookings/:id", verifyToken, async (req, res) => {
       try {
-        const id = req.params.id;
+        const { id } = req.params;
         if (!ObjectId.isValid(id))
           return res.status(400).json({ message: "Invalid id" });
 
@@ -821,167 +865,60 @@ async function run() {
         const result = await bookingsCollection.deleteOne({
           _id: new ObjectId(id),
         });
-        res.json({ success: result.deletedCount > 0 });
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ message: "Booking not found" });
+        }
+        res.json({ success: true, message: "Booking canceled successfully" });
       } catch (err) {
+        console.error("Failed to delete booking:", err);
         res.status(500).json({ message: "Failed to delete booking" });
       }
     });
-
-    // 7a. Update booking status only
-    app.put(
-      "/api/bookings/:id/status",
-      verifyToken,
-      requireRole(["admin", "decorator"]),
-      async (req, res) => {
-        try {
-          const id = req.params.id;
-          const { status } = req.body;
-
-          if (!ObjectId.isValid(id)) {
-            return res.status(400).json({ message: "Invalid booking ID" });
-          }
-
-          if (!status) {
-            return res.status(400).json({ message: "Status is required" });
-          }
-
-          const result = await bookingsCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: { status: status, updatedAt: new Date() } }
-          );
-
-          res.json({
-            success: result.modifiedCount > 0,
-            message: "Status updated",
-          });
-        } catch (err) {
-          res.status(500).json({ message: "Failed to update booking status" });
-        }
-      }
-    );
-
-    // 7b. Update payment status
-    app.put(
-      "/api/bookings/:id/payment",
-      verifyToken,
-      requireRole(["admin"]),
-      async (req, res) => {
-        try {
-          const id = req.params.id;
-          const { isPaid } = req.body;
-
-          if (!ObjectId.isValid(id)) {
-            return res.status(400).json({ message: "Invalid booking ID" });
-          }
-
-          const updateDoc = {
-            isPaid: isPaid,
-            paymentStatus: isPaid ? "completed" : "pending",
-            updatedAt: new Date(),
-          };
-
-          const result = await bookingsCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: updateDoc }
-          );
-
-          res.json({
-            success: result.modifiedCount > 0,
-            message: "Payment status updated",
-          });
-        } catch (err) {
-          res.status(500).json({ message: "Failed to update payment status" });
-        }
-      }
-    );
-
-    // 8. Admin: Assign decorator to a booking
-    app.put(
-      "/api/bookings/assign/:id",
-      verifyToken,
-      requireRole(["admin"]),
-      async (req, res) => {
-        try {
-          const id = req.params.id;
-          const { decoratorId } = req.body;
-
-          if (
-            !ObjectId.isValid(id) ||
-            !decoratorId ||
-            decoratorId.length !== 24
-          ) {
-            return res
-              .status(400)
-              .json({ message: "Invalid Booking ID or Decorator ID" });
-          }
-
-          const result = await bookingsCollection.updateOne(
-            { _id: new ObjectId(id) },
-            {
-              $set: {
-                decoratorId: decoratorId,
-                assignedDecorator: decoratorId,
-                status: "Assigned",
-                updatedAt: new Date(),
-              },
-            }
-          );
-
-          res.json({ success: result.modifiedCount > 0 });
-        } catch (err) {
-          res.status(500).json({ message: "Failed to assign decorator" });
-        }
-      }
-    );
 
     // -------------------------------------------------------------
     // --- ADMIN/DECORATOR MANAGEMENT ROUTES ---
     // -------------------------------------------------------------
 
-    // Admin Analytics and Revenue Route
     app.get(
       "/api/admin/analytics",
       verifyToken,
       requireRole(["admin"]),
       async (req, res) => {
         try {
-          const pipeline = [
-            {
-              $group: {
-                _id: null,
-                totalRevenue: { $sum: "$amount" },
-                totalTransactions: { $sum: 1 },
-              },
-            },
-          ];
           const revenueResult = await paymentsCollection
-            .aggregate(pipeline)
+            .aggregate([
+              {
+                $group: {
+                  _id: null,
+                  totalRevenue: { $sum: "$amount" },
+                  totalTransactions: { $sum: 1 },
+                },
+              },
+            ])
             .toArray();
 
           const totalRevenue = revenueResult[0]?.totalRevenue || 0;
-
           const totalBookings = await bookingsCollection.countDocuments();
           const completedBookings = await bookingsCollection.countDocuments({
             status: "Completed",
           });
-
           const activeDecorators = await usersCollection.countDocuments({
             role: "decorator",
           });
 
           res.json({
-            totalRevenue: totalRevenue,
-            totalBookings: totalBookings,
-            completedBookings: completedBookings,
-            activeDecorators: activeDecorators,
+            totalRevenue,
+            totalBookings,
+            completedBookings,
+            activeDecorators,
           });
         } catch (err) {
+          console.error("Failed to fetch analytics data:", err);
           res.status(500).json({ message: "Failed to fetch analytics data" });
         }
       }
     );
 
-    // Decorator request routes
     app.post("/api/decorator-requests", verifyToken, async (req, res) => {
       try {
         const {
@@ -1013,7 +950,6 @@ async function run() {
           createdAt: new Date(),
         };
 
-        // Check if user already has a pending request
         const existingRequest = await usersCollection.findOne({
           _id: new ObjectId(req.user.id),
           decoratorRequestStatus: "pending",
@@ -1025,7 +961,6 @@ async function run() {
             .json({ message: "You already have a pending decorator request" });
         }
 
-        // Add decorator request info to user document
         await usersCollection.updateOne(
           { _id: new ObjectId(req.user.id) },
           {
@@ -1043,45 +978,36 @@ async function run() {
             "Decorator request submitted successfully! We will review and contact you soon.",
         });
       } catch (err) {
+        console.error("Failed to submit decorator request:", err);
         res.status(500).json({ message: "Failed to submit decorator request" });
       }
     });
 
-    // Get all decorator requests (Admin only)
     app.get(
       "/api/decorator-requests",
       verifyToken,
       requireRole(["admin"]),
       async (req, res) => {
         try {
-          const users = await usersCollection
+          const usersWithRequests = await usersCollection
             .find({
-              decoratorRequestStatus: { $exists: true },
+              decoratorRequestStatus: { $in: ["pending", "rejected"] },
             })
             .project({ password: 0 })
             .toArray();
 
-          // Transform data to match frontend expectations
-          const requests = users.map((user) => ({
-            _id: user._id,
-            user: {
-              name: user.name,
-              email: user.email,
-            },
-            experience: user.decoratorRequest?.experience || "Not specified",
-            specialty: user.decoratorRequest?.specialty || "Not specified",
-            phone: user.decoratorRequest?.phone || "Not provided",
-            location: user.decoratorRequest?.location || "Not specified",
-            expectedRate: user.decoratorRequest?.expectedRate || null,
-            portfolio: user.decoratorRequest?.portfolio || null,
-            description:
-              user.decoratorRequest?.description || "No description provided",
-            status: user.decoratorRequestStatus || "pending",
-            createdAt: user.decoratorRequest?.createdAt || user.createdAt,
+          const requests = usersWithRequests.map((user) => ({
+            _id: user._id, // This is the user ID
+            userId: user._id,
+            userName: user.name,
+            userEmail: user.email,
+            ...user.decoratorRequest,
+            status: user.decoratorRequestStatus,
           }));
 
           res.json(requests);
         } catch (err) {
+          console.error("Failed to fetch decorator requests:", err);
           res
             .status(500)
             .json({ message: "Failed to fetch decorator requests" });
@@ -1089,7 +1015,6 @@ async function run() {
       }
     );
 
-    // Approve decorator request
     app.put(
       "/api/decorator-requests/:id/approve",
       verifyToken,
@@ -1111,9 +1036,14 @@ async function run() {
               },
             }
           );
-
-          res.json({ success: result.modifiedCount > 0 });
+          if (result.matchedCount === 0) {
+            return res
+              .status(404)
+              .json({ message: "User with request not found" });
+          }
+          res.json({ success: true, message: "Request approved" });
         } catch (err) {
+          console.error("Failed to approve decorator request:", err);
           res
             .status(500)
             .json({ message: "Failed to approve decorator request" });
@@ -1121,7 +1051,6 @@ async function run() {
       }
     );
 
-    // Reject decorator request
     app.put(
       "/api/decorator-requests/:id/reject",
       verifyToken,
@@ -1142,9 +1071,14 @@ async function run() {
               },
             }
           );
-
-          res.json({ success: result.modifiedCount > 0 });
+          if (result.matchedCount === 0) {
+            return res
+              .status(404)
+              .json({ message: "User with request not found" });
+          }
+          res.json({ success: true, message: "Request rejected" });
         } catch (err) {
+          console.error("Failed to reject decorator request:", err);
           res
             .status(500)
             .json({ message: "Failed to reject decorator request" });
@@ -1152,38 +1086,14 @@ async function run() {
       }
     );
 
-    // Get decorators and users
-    app.get(
-      "/api/decorators",
-      verifyToken,
-      requireRole(["admin"]),
-      async (req, res) => {
-        try {
-          const decorators = await usersCollection
-            .find({ role: "decorator" })
-            .project({ password: 0 })
-            .toArray();
-          res.json(decorators);
-        } catch (err) {
-          res.status(500).json({ message: "Failed to fetch decorators" });
-        }
-      }
-    );
-
-    // Public endpoint for top-rated decorators
     app.get("/api/decorators/top-rated", async (req, res) => {
       try {
         const decorators = await usersCollection
-          .find({
-            role: "decorator",
-          })
-          .project({
-            password: 0,
-          })
+          .find({ role: "decorator" })
+          .project({ password: 0 })
           .limit(4)
           .toArray();
 
-        // Only return actual decorators with enhanced data
         const topDecorators = decorators.map((decorator, index) => ({
           ...decorator,
           averageRating: 4.5 + index * 0.1,
@@ -1197,26 +1107,25 @@ async function run() {
 
         res.json({ data: topDecorators });
       } catch (err) {
+        console.error("Failed to fetch top decorators:", err);
         res.status(500).json({ message: "Failed to fetch top decorators" });
       }
     });
 
-    app.put(
-      "/api/decorators/:id",
+    app.get(
+      "/api/decorators",
       verifyToken,
       requireRole(["admin"]),
       async (req, res) => {
         try {
-          const id = req.params.id;
-          if (!ObjectId.isValid(id))
-            return res.status(400).json({ message: "Invalid user ID" });
-          const result = await usersCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: { role: "decorator" } }
-          );
-          res.json({ success: result.modifiedCount > 0 });
+          const decorators = await usersCollection
+            .find({ role: "decorator" })
+            .project({ password: 0 })
+            .toArray();
+          res.json(decorators);
         } catch (err) {
-          res.status(500).json({ message: "Failed to update user role" });
+          console.error("Failed to fetch decorators:", err);
+          res.status(500).json({ message: "Failed to fetch decorators" });
         }
       }
     );
@@ -1233,6 +1142,7 @@ async function run() {
             .toArray();
           res.json(users);
         } catch (err) {
+          console.error("Failed to fetch users:", err);
           res.status(500).json({ message: "Failed to fetch users" });
         }
       }
@@ -1244,7 +1154,7 @@ async function run() {
       requireRole(["admin"]),
       async (req, res) => {
         try {
-          const id = req.params.id;
+          const { id } = req.params;
           const { role } = req.body;
           if (!ObjectId.isValid(id))
             return res.status(400).json({ message: "Invalid user ID" });
@@ -1254,25 +1164,16 @@ async function run() {
             { _id: new ObjectId(id) },
             { $set: { role } }
           );
-          res.json({ success: result.modifiedCount > 0 });
+          if (result.matchedCount === 0) {
+            return res.status(404).json({ message: "User not found" });
+          }
+          res.json({ success: true, message: "User role updated" });
         } catch (err) {
+          console.error("Failed to update user role:", err);
           res.status(500).json({ message: "Failed to update user role" });
         }
       }
     );
-
-    // --- Migration: Update old paid bookings to Completed status ---
-    try {
-      const result = await bookingsCollection.updateMany(
-        {
-          paymentStatus: "completed",
-          status: { $in: ["Planning Phase", "Assigned"] },
-        },
-        { $set: { status: "Completed" } }
-      );
-    } catch (err) {
-      // Migration error can be ignored in production logging
-    }
 
     // Final ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
