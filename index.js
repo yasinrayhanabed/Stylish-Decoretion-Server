@@ -49,7 +49,10 @@ if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 const upload = multer({ storage: multer.memoryStorage() });
 
 const corsOptions = {
-  origin: "http://localhost:5173",
+  origin: [
+    "http://localhost:5173",
+    process.env.CLIENT_URL,
+  ],
   methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
   credentials: true,
   optionsSuccessStatus: 204,
@@ -59,9 +62,16 @@ app.use(express.json());
 
 let usersCollection, servicesCollection, bookingsCollection, paymentsCollection;
 
+  app.get("/", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Stylish Decoration API is running 🚀",
+  });
+});
+
 async function run() {
   try {
-    await client.connect();
+    // await client.connect();
     console.log("Connected to MongoDB");
 
     const db = client.db(process.env.DB_NAME || "style-decor");
@@ -96,6 +106,13 @@ async function run() {
           return res.status(403).json({ message: "Forbidden" });
         next();
       };
+
+    
+
+app.get("/favicon.ico", (req, res) => res.status(204).end());
+app.get("/favicon.png", (req, res) => res.status(204).end());
+
+
 
     // -------------------------------------------------------------
     // --- AUTH ROUTES ---
@@ -1175,19 +1192,18 @@ app.delete(
       }
     );
 
-    // Final ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Successfully connected to MongoDB and set up routes.");
-  } catch (err) {
-    console.error("Failed to start the server:", err);
-    process.exit(1); // Exit if the server fails to start
-  }
+    // await client.db("admin").command({ ping: 1 });
+    // console.log("Successfully connected to MongoDB and set up routes.");
+  // } catch (err) {
+  //   console.error("Failed to start the server:", err);
+  //   process.exit(1); 
+  // }
+} finally{}
 }
-
 run().catch(console.dir); // Initialize routes and DB connection
 
-app.listen(port, () => {
-  console.log(`Server is running on http://localhost:${port}`);
-});
+// app.listen(port, () => {
+//   console.log(`Server is running on http://localhost:${port}`);
+// });
 
-module.exports = app; // Export the app for Vercel
+module.exports = app; 
