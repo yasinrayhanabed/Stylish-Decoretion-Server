@@ -50,7 +50,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 const corsOptions = {
   origin: [
-    "http://localhost:5173",
+    "https://stylish-decoretor.web.app",
     process.env.CLIENT_URL,
   ],
   methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
